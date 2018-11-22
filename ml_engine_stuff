@@ -1,0 +1,110 @@
+
+NOTES ON TRAINING WITH GCP ML ENGINE
+
+
+
+##Things you need on bucket:
+model checkpoints
+config file
+label.pbtxt
+train and validation tf.records
+packaged code to run on cloud
+
+##MODEL
+wget http://storage.googleapis.com/download.tensorflow.org/models/object_detection/faster_rcnn_resnet101_coco_11_06_2017.tar.gz
+tar -xvf faster_rcnn_resnet101_coco_11_06_2017.tar.gz
+gsutil cp faster_rcnn_resnet101_coco_11_06_2017/model.ckpt.* gs://${YOUR_GCS_BUCKET}/data/
+
+
+gcloud ml-engine jobs submit training "pets2classes2" \
+    --runtime-version 1.9 \
+    --job-dir=gs://pets2class/model_dir \
+    --packages dist/object_detection-0.1.tar.gz,slim/dist/slim-0.1.tar.gz,/tmp/pycocotools/pycocotools-2.0.tar.gz \
+    --module-name object_detection.model_main \
+    --region us-central1 \
+    --config object_detection/samples/cloud/cloud.yml \
+    -- \
+    --model_dir=gs://pets2class/model_dir \
+    --pipeline_config_path=gs://pets2class/data/pets2class.config
+
+##Config file
+sed -i "s|PATH_TO_BE_CONFIGURED|"${BUCKET}"/data|g" \
+    object_detection/samples/configs/faster_rcnn_inception_resnet_v2_atrous_oid.config
+gsutil cp object_detection/samples/configs/faster_rcnn_inception_resnet_v2_atrous_oid.config \
+    ${BUCKET}/data/
+
+/object_detection/samples/configs/faster_rcnn_inception_resnet_v2_atrous_oid.config
+
+
+## To pack api
+bash object_detection/dataset_tools/create_pycocotools_package.sh /tmp/pycocotools
+python setup.py sdist
+(cd slim && python setup.py sdist)
+
+gcloud ml-engine jobs submit training random_cats1 \
+    --job-dir=gs://pet_rand/model_dir \
+    --packages dist/object_detection-0.1.tar.gz,slim/dist/slim-0.1.tar.gz,/tmp/pycocotools/pycocotools-2.0.tar.gz \
+    --module-name object_detection.model_main \
+    --region us-central1 \
+    --config object_detection/samples/cloud/cloud.yml \
+    -- \
+    --model_dir=gs://pet_rand/model_dir \
+    --pipeline_config_path=gs://pet_rand/data/faster_rcnn_resnet101_pets.config 
+
+
+gsutil cp gs://${YOUR_GCS_BUCKET}/model_dir/model.ckpt-${CHECKPOINT_NUMBER}.* .
+python object_detection/export_inference_graph.py \
+    --input_type image_tensor \
+    --pipeline_config_path object_detection/samples/configs/faster_rcnn_resnet101_pets.config \
+    --trained_checkpoint_prefix rand_cats/model.ckpt-595 \
+    --output_directory rand_cats
+
+gsutil cp gs://pet_rand/model_dir/model.ckpt-$995.* .
+python object_detection/export_inference_graph.py \
+    --input_type image_tensor \
+    --pipeline_config_path object_detection/samples/configs/faster_rcnn_resnet101_pets.config \
+    --trained_checkpoint_prefix model.ckpt-995 \
+    --output_directory exported_graphs
+
+
+##To mount the extra disk:
+	##only when need to erase disk --> sudo mkfs.ext4 -m 0 -F -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/sdb
+	sudo mkdir -p /mnt/disks/oid200;\
+	sudo mount -o discard,defaults /dev/sdb /mnt/disks/oid200; \
+	sudo chmod a+w /mnt/disks/oid200
+
+python -m object_detection/dataset_tools/create_oid_tf_record \
+  --input_box_annotations_csv /mnt/disks/oid200/2017_07/train/annotations-human-bbox.csv \
+  --input_images_directory /mnt/disks/oid200/train_0 \
+  --input_label_map object_detection/data/oid_bbox_trainable_label_map.pbtxt \
+  --output_tf_record_path_prefix /mnt/disks/oid200/tfrec_train/train.tfrecord \
+  --num_shards=100 \
+  --logs="/mnt/disks/oid200/train1.log" \
+  --process=1 \
+  --num_process=11
+
+END=5
+for ((i=0;i<END;i++)); do
+    echo $i
+	python -m object_detection/dataset_tools/create_oid_tf_record \
+  	--input_box_annotations_csv /mnt/disks/oid200/2017_07/train/annotations-human-bbox.csv \
+  	--input_images_directory /mnt/disks/oid200/train_0 \
+  	--input_label_map object_detection/data/oid_bbox_trainable_label_map.pbtxt \
+  	--output_tf_record_path_prefix /mnt/disks/oid200/tfrec_train/train.tfrecord \
+  	--num_shards=100 \
+  	--logs="/mnt/disks/oid200/logs/train$i.log" \
+  	--process=$i \
+  	--num_process=END &
+done
+
+echo {0..11} | xargs -n 1 echo | parallel -I % \
+python -m object_detection/dataset_tools/create_oid_tf_record \
+  --input_box_annotations_csv /mnt/disks/oid200/2017_07/train/annotations-human-bbox.csv \
+  --input_images_directory /mnt/disks/oid200/train_0 \
+  --input_label_map object_detection/data/oid_bbox_trainable_label_map.pbtxt \
+  --output_tf_record_path_prefix /mnt/disks/oid200/tfrec_train/train.tfrecord \
+  --num_shards=100 \
+  --logs="/mnt/disks/oid200/logs/train%.log" \
+  --process=% \
+  --num_process=12
+
